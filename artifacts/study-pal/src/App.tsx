@@ -7,7 +7,7 @@ import {
 import { lessons as defaultLessons, createId, type Audience, type ChatMessage, type LessonChunk, type Progress, type QuizAttempt } from './study-data';
 import { askTutor, generateLesson } from './ai';
 import { localStore } from './local-store';
-import { retrieveLessons } from './retrieval';
+import { buildExcerpt, retrieveLessons } from './retrieval';
 
 type WorkerReply = { type: string; text?: string; progress?: number; backend?: string; model?: string; scope?: string };
 type InstallPrompt = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }> };
@@ -48,6 +48,7 @@ function App() {
   const [quizAnswers, setQuizAnswers] = useState<number[]>([]);
   const [quizSubmitted, setQuizSubmitted] = useState(false);
   const workerRef = useRef<Worker | null>(null);
+  const lastExcerptRef = useRef<{ title: string; excerpt: string } | null>(null);
   const chatScroll = useRef<HTMLDivElement>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -153,7 +154,7 @@ function App() {
     }
   };
 
-  const removeLesson = async (lesson: LessonChunk) => {
+const removeLesson = async (lesson: LessonChunk) => {
     try {
       await localStore.deleteLesson(lesson.id);
       setLibrary((items) => items.filter((item) => item.id !== lesson.id));
@@ -251,7 +252,15 @@ function App() {
           if (reply.scope === 'chat') {
             setChatBusy(false);
             setChatError(reply.text ?? 'Local answer could not be completed.');
-            setMessages((items) => items.filter((message) => message.id !== 'streaming'));
+            const fallback = lastExcerptRef.current;
+            lastExcerptRef.current = null;
+            setMessages((items) => {
+              const rest = items.filter((message) => message.id !== 'streaming');
+              if (!fallback) return rest;
+              const answer: ChatMessage = { id: createId(), role: 'assistant', text: `The offline model could not finish, so here is the most relevant part of your saved lesson "${fallback.title}":\n\n${fallback.excerpt}`, sources: [fallback.title] };
+              void localStore.saveMessage(answer).catch(() => undefined);
+              return [...rest, answer];
+            });
           } else {
             setModelState('error');
             setModelStatus(reply.text ?? 'Model setup failed.');
@@ -259,6 +268,7 @@ function App() {
             await localStore.saveSetting('loadedModel', '');
           }
         } else if (reply.type === 'token') {
+          lastExcerptRef.current = null;
           setMessages((items) => items.map((message) => message.role === 'assistant' && message.id === 'streaming' ? { ...message, text: message.text + (reply.text ?? '') } : message));
         } else if (reply.type === 'done') {
           setChatBusy(false);
@@ -277,7 +287,7 @@ function App() {
     }
   };
 
-  const submitChat = async (questionText?: string) => {
+const submitChat = async (questionText?: string) => {
     const question = (questionText ?? chatInput).trim();
     if (!question || chatBusy) return;
     setChatInput('');
@@ -316,7 +326,9 @@ function App() {
       return;
     }
     const sources = retrieved.map((item) => `${item.lesson.title} (${item.lesson.topic})`);
-    const material = retrieved.map(({ lesson }) => `Lesson: ${lesson.title}\nTopic: ${lesson.topic}\n${lesson.text}\nExamples: ${lesson.examples.join(' ')}`).join('\n\n');
+    const top = retrieved.slice(0, 2);
+    const material = top.map(({ lesson }, index) => `Lesson: ${lesson.title}\n${buildExcerpt(question, lesson, index === 0 ? 1000 : 600)}`).join('\n\n');
+    lastExcerptRef.current = { title: top[0].lesson.title, excerpt: buildExcerpt(question, top[0].lesson, 700) };
     const placeholder: ChatMessage = { id: 'streaming', role: 'assistant', text: '', sources };
     setMessages((items) => [...items, placeholder]);
     setChatBusy(true);
@@ -483,7 +495,7 @@ function App() {
           </aside>
         </div>
 
-        <section className="chat-card" aria-label="Grounded study chat">
+      <section className="chat-card" aria-label="Grounded study chat">
           <div className="chat-head"><div><h2>A question for Study Pal?</h2><p>Ask about your lessons or any study question. Your chat is saved on this device.</p></div><button className="icon-button" onClick={() => void clearChat()} aria-label="Clear chat history" title="Clear chat history"><X size={16} /></button></div>
           <div className="chat-body" ref={chatScroll} aria-live="polite">
             {!messages.length && <div className="chat-empty"><strong>Your chat stays on this device.</strong>Ask a question below. When you are online the AI tutor answers, using your saved lessons first. Offline answers need a downloaded local model.</div>}
@@ -567,4 +579,4 @@ function QuizResult({ lesson, answers, onClose }: { lesson: LessonChunk; answers
   </div>;
 }
 
-export default App;
+export default App;  
