@@ -1,6 +1,6 @@
 import type { LessonChunk } from './study-data';
 
-const terms = (text: string) => text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+const terms = (text: string): string[] => text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
 const stopWords = new Set(['a', 'an', 'and', 'are', 'as', 'at', 'be', 'do', 'does', 'for', 'from', 'how', 'i', 'in', 'is', 'it', 'of', 'on', 'or', 'that', 'the', 'to', 'what', 'when', 'where', 'which', 'who', 'why', 'with', 'you']);
 
 export function retrieveLessons(query: string, lessons: LessonChunk[], limit = 3) {
