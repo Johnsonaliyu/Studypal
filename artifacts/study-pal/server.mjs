@@ -32,7 +32,10 @@ const compressible = new Set(['.html', '.js', '.mjs', '.css', '.json', '.webmani
 // (GROQ_API_KEY) and is never sent to the browser.
 // ---------------------------------------------------------------------------
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+// llama-3.3-70b-versatile was shut down by Groq on 2026-08-16; gpt-oss-120b is their recommended replacement.
+const GROQ_MODEL = (process.env.GROQ_MODEL || 'openai/gpt-oss-120b').trim();
+// If the primary model is ever retired again, try these before giving up.
+const FALLBACK_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b'].filter((m) => m !== GROQ_MODEL);
 const MAX_BODY = 60_000;
 
 class ApiError extends Error {
@@ -61,35 +64,56 @@ async function readJson(req) {
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
   catch { throw new ApiError(400, 'Invalid request.'); }
-}
+  }
 
-async function groq(messages, { json = false, maxTokens = 2200, temperature = 0.4 } = {}) {
-  const key = process.env.GROQ_API_KEY;
-  if (!key) throw new ApiError(503, 'The AI is not set up yet. Add GROQ_API_KEY to the server environment.');
+async function groqRequest(model, messages, { json, maxTokens, temperature }, key) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45_000);
   try {
-    const response = await fetch(GROQ_URL, {
+    const isReasoning = model.startsWith('openai/gpt-oss');
+    return await fetch(GROQ_URL, {
       method: 'POST',
       signal: controller.signal,
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: GROQ_MODEL, messages, temperature, max_tokens: maxTokens,
+        model, messages, temperature,
+        // Reasoning models spend part of the token budget on thinking, so give them more room and keep it short.
+        max_tokens: isReasoning ? maxTokens + 2000 : maxTokens,
+        ...(isReasoning ? { reasoning_effort: 'low' } : {}),
         ...(json ? { response_format: { type: 'json_object' } } : {}),
       }),
     });
-    if (response.status === 429) throw new ApiError(429, 'The AI is busy right now. Try again in a moment.');
-    if (!response.ok) {
-      console.error('Groq error', response.status, (await response.text()).slice(0, 300));
-      throw new ApiError(502, 'The AI could not answer just now. Please try again.');
+  } finally { clearTimeout(timer); }
+}
+
+async function groq(messages, { json = false, maxTokens = 2200, temperature = 0.4 } = {}) {
+  // Trim whitespace and stray quotes that are easy to paste into a Railway variable.
+  const key = (process.env.GROQ_API_KEY ?? '').trim().replace(/^["']|["']$/g, '');
+  if (!key) throw new ApiError(503, 'The AI is not set up yet. Add GROQ_API_KEY to the server environment.');
+  const opts = { json, maxTokens, temperature };
+  try {
+    for (const model of [GROQ_MODEL, ...FALLBACK_MODELS]) {
+      const response = await groqRequest(model, messages, opts, key);
+      if (response.status === 429) throw new ApiError(429, 'The AI is busy right now. Try again in a moment.');
+      if (response.ok) {
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content ?? '';
+      }
+      const detail = (await response.text()).slice(0, 400);
+      console.error(`Groq error status=${response.status} model=${model} body=${detail}`);
+      if (response.status === 401 || response.status === 403) {
+        throw new ApiError(502, 'The AI key was rejected. Check GROQ_API_KEY on the server.');
+      }
+      // 400/404 usually means this model is retired or unavailable: try the next one.
+      if (response.status !== 400 && response.status !== 404) break;
     }
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content ?? '';
+    throw new ApiError(502, 'The AI could not answer just now. Please try again.');
   } catch (error) {
     if (error instanceof ApiError) throw error;
     if (error?.name === 'AbortError') throw new ApiError(504, 'The AI took too long. Please try again.');
+    console.error('Groq fetch failed', error);
     throw new ApiError(502, 'Could not reach the AI service.');
-  } finally { clearTimeout(timer); }
+  }
 }
 
 const audienceInfo = {
