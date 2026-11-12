@@ -64,6 +64,8 @@ export default defineConfig({
     strictPort: true,
     host: '0.0.0.0',
     allowedHosts: true,
+    // In dev, forward /api to the local Study Pal server (run `pnpm --filter @workspace/study-pal run dev:api`).
+    proxy: { '/api': 'http://localhost:8787' },
     fs: {
       strict: true,
     },
@@ -74,3 +76,4 @@ export default defineConfig({
     allowedHosts: true,
   },
 });
+                                                                       
