@@ -5,6 +5,8 @@ export type QuizQuestion = {
   explanation: string;
 };
 
+export type Audience = 'secondary' | 'university';
+
 export type LessonChunk = {
   id: string;
   topic: string;
@@ -14,6 +16,9 @@ export type LessonChunk = {
   examples: string[];
   questions: QuizQuestion[];
   minutes: number;
+  source?: 'sample' | 'ai';
+  audience?: Audience;
+  createdAt?: string;
 };
 
 export type Progress = {
