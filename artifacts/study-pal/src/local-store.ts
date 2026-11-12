@@ -47,6 +47,8 @@ export const localStore = {
       tx.onabort = () => reject(tx.error ?? new Error('Lesson library save was interrupted.'));
     });
   },
+  saveLesson: (lesson: LessonChunk) => request<IDBValidKey>('lessons', (store) => store.put(lesson), 'readwrite'),
+  deleteLesson: (id: string) => request<undefined>('lessons', (store) => store.delete(id), 'readwrite'),
   getLessons: () => request<LessonChunk[]>('lessons', (store) => store.getAll()),
   getProgress: () => request<Progress[]>('progress', (store) => store.getAll()),
   getAttempts: () => request<QuizAttempt[]>('attempts', (store) => store.getAll()),
@@ -60,3 +62,4 @@ export const localStore = {
     await request<undefined>('messages', (store) => store.clear(), 'readwrite');
   },
 };
+    
