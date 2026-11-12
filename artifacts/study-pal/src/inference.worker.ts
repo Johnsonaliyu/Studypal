@@ -88,11 +88,10 @@ async function loadModel(request: Extract<WorkerRequest, { type: 'load' }>) {
     }
   }
   try {
-    const wllama = await import('@wllama/wllama');
-    const Wllama = (wllama as any).Wllama;
-    const paths = (wllama as any).WLLAMA_CONFIG_PATHS;
-    if (!Wllama || !paths) throw new Error('This installed wllama package does not expose the documented browser API.');
-    engine = new Wllama(paths);
+    const { Wllama } = await import('@wllama/wllama');
+    // wllama does not ship ready-made paths: the app must tell it where the .wasm file is. Vite turns "?url" into a hashed asset URL.
+    const wasmUrl = (await import('@wllama/wllama/esm/wasm/wllama.wasm?url')).default;
+    engine = new Wllama({ default: wasmUrl });
     const cpuModel = cpuModels[request.model];
     await engine.loadModelFromHF(cpuModel, {
       n_gpu_layers: 0,
@@ -188,3 +187,4 @@ ctx.addEventListener('unhandledrejection', (event) => {
 });
 
 export {};
+  
