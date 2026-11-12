@@ -1,6 +1,6 @@
-# [Project name]
+# Offline Study Tutor (Study Pal)
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Offline-first PWA with saved lessons, quizzes, local progress and a grounded study chat powered by in-browser models (WebLLM on WebGPU, wllama on WASM CPU).
 
 ## Run & Operate
 
@@ -43,3 +43,10 @@ _Populate as you build — sharp edges, "always run X before Y" rules._
 ## Pointers
 
 - See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+
+## Deploy to Railway
+
+- Web app is `artifacts/study-pal` (static, client-side only). The `api-server` and `db` packages are not needed in production.
+- Railway uses the root `Dockerfile`: installs only `@workspace/study-pal...`, runs `vite build`, then `node artifacts/study-pal/server.mjs` (zero-dependency static server with SPA fallback and `/healthz`).
+- No environment variables required. `PORT` is injected by Railway; `BASE_PATH` defaults to `/`.
+- Refresh the lockfile in Replit (`pnpm install`) and commit it so `pnpm-lock.yaml` includes `@mlc-ai/web-llm` and `@wllama/wllama`.

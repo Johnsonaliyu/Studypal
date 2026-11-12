@@ -45,7 +45,7 @@ function App() {
   const [quizSubmitted, setQuizSubmitted] = useState(false);
   const workerRef = useRef<Worker | null>(null);
   const chatScroll = useRef<HTMLDivElement>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout>>();
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const notify = useCallback((text: string) => {
     setToast(text);
