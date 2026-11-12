@@ -25,3 +25,21 @@ export function retrieveLessons(query: string, lessons: LessonChunk[], limit = 3
     return { lesson, score };
   }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score).slice(0, limit);
 }
+
+// Small on-device models are slow and easily overwhelmed by long prompts, so send only the most relevant paragraphs.
+export function buildExcerpt(query: string, lesson: LessonChunk, maxChars = 900): string {
+  const queryTerms = new Set(terms(query).filter((term) => !stopWords.has(term)));
+  const paragraphs = lesson.text.split(/\n\s*\n|(?<=[.!?])\s+(?=[A-Z])/).map((p) => p.trim()).filter(Boolean);
+  const ranked = paragraphs
+    .map((text, index) => ({ text, index, score: terms(text).filter((word) => queryTerms.has(word)).length }))
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+  const chosen: typeof ranked = [];
+  let used = 0;
+  for (const item of ranked) {
+    if (used + item.text.length > maxChars && chosen.length) continue;
+    chosen.push(item);
+    used += item.text.length;
+    if (used >= maxChars) break;
+  }
+  return chosen.sort((a, b) => a.index - b.index).map((item) => item.text).join(' ').slice(0, maxChars + 200);
+}
