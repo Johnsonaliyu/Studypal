@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Study Pal"
+description = "An offline-first learning PWA for students, with locally downloaded AI models, searchable curriculum lessons, grounded study chat, quizzes, and private progress tracking."
+version = "1.0.0"
+id = "artifacts/study-pal"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24270
+
+[services.development]
+run = "pnpm --filter @workspace/study-pal run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/study-pal", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/study-pal/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24270"
+BASE_PATH = "/"
