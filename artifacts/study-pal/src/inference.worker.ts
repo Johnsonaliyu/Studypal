@@ -2,6 +2,7 @@
 type WorkerRequest =
   | { type: 'load'; backend: 'webgpu' | 'cpu'; model: 'lite' | 'standard' }
   | { type: 'answer'; prompt: string; material: string; question: string }
+  | { type: 'stop' }
   | { type: 'unload' };
 
 const ctx: DedicatedWorkerGlobalScope = self as DedicatedWorkerGlobalScope;
@@ -13,6 +14,17 @@ const webGpuModels: Record<string, string> = {
   lite: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC',
   standard: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
 };
+// Phones without the WebGPU "shader-f16" feature cannot run the q4f16 builds, so use the q4f32 builds there.
+const webGpuModelsF32: Record<string, string> = {
+  lite: 'Qwen2.5-0.5B-Instruct-q4f32_1-MLC',
+  standard: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC',
+};
+const FIRST_TOKEN_TIMEOUT_MS = 60_000;
+const withTimeout = <T,>(promise: Promise<T>, ms: number, message: string): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
+  });
 const cpuModels = {
   lite: { repo: 'bartowski/Qwen2.5-0.5B-Instruct-GGUF', file: 'Qwen2.5-0.5B-Instruct-Q4_K_M.gguf' },
   standard: { repo: 'bartowski/Qwen2.5-1.5B-Instruct-GGUF', file: 'Qwen2.5-1.5B-Instruct-Q4_K_M.gguf' },
@@ -29,12 +41,26 @@ async function loadModel(request: Extract<WorkerRequest, { type: 'load' }>) {
   if (selectedBackend === 'webgpu') {
     try {
       const webllm = await import('@mlc-ai/web-llm');
-      const modelId = webGpuModels[request.model];
       const list = (webllm.prebuiltAppConfig as any)?.model_list as Array<{ model_id: string }> | undefined;
-      if (list && !list.some((item) => item.model_id === modelId)) throw new Error(`The installed WebLLM registry does not include ${modelId}. Update the app to use a supported model.`);
+      const adapter = await (navigator as any).gpu.requestAdapter();
+      if (!adapter) throw new Error('No WebGPU graphics adapter was found on this device. Choose the CPU option instead.');
+      const hasF16 = adapter.features?.has?.('shader-f16') ?? false;
+      let modelId = hasF16 ? webGpuModels[request.model] : webGpuModelsF32[request.model];
+      if (list && !list.some((item) => item.model_id === modelId)) {
+        const alternative = hasF16 ? webGpuModelsF32[request.model] : webGpuModels[request.model];
+        if (list.some((item) => item.model_id === alternative)) modelId = alternative;
+        else throw new Error(`The installed WebLLM registry does not include ${modelId}. Update the app to use a supported model.`);
+      }
       engine = await webllm.CreateMLCEngine(modelId, {
         initProgressCallback: (progress: { progress?: number; text?: string }) => ctx.postMessage({ type: 'progress', progress: Math.round((progress.progress ?? 0) * 100), text: progress.text ?? 'Preparing WebGPU model…' }),
       });
+      // Prove the model can really generate before telling the student it is ready.
+      ctx.postMessage({ type: 'progress', progress: 100, text: 'Testing the model…' });
+      await withTimeout(
+        engine.chat.completions.create({ messages: [{ role: 'user', content: 'Say hi.' }], max_tokens: 4, temperature: 0 }),
+        FIRST_TOKEN_TIMEOUT_MS,
+        'The model downloaded but could not generate text on this device. Try the CPU option, or the Lite model.',
+      );
       backendInUse = 'WebGPU';
       ctx.postMessage({ type: 'ready', backend: backendInUse, model: modelId });
     } catch (error) {
@@ -66,6 +92,20 @@ async function loadModel(request: Extract<WorkerRequest, { type: 'load' }>) {
 async function answer(question: string, material: string, prefix: string) {
   if (!engine) throw new Error('Choose and prepare a local model before asking the study chat.');
   aborted = false;
+  // If nothing arrives for a while, stop generating and tell the student instead of spinning forever.
+  let gotToken = false;
+  const watchdog = setTimeout(() => {
+    if (gotToken) return;
+    aborted = true;
+    try { engine?.interruptGenerate?.(); } catch { /* ignore */ }
+    ctx.postMessage({ type: 'error', scope: 'chat', text: 'The offline model took too long to start answering on this device.' });
+  }, FIRST_TOKEN_TIMEOUT_MS);
+  try {
+    await generate(question, material, prefix, () => { gotToken = true; clearTimeout(watchdog); });
+  } finally { clearTimeout(watchdog); }
+}
+
+async function generate(question: string, material: string, prefix: string, onToken: () => void) {
   const prompt = `${prefix}\n\n${material}\n\nQuestion: ${question}`;
   if (backendInUse === 'WebGPU') {
     const response = await engine.chat.completions.create({
@@ -81,8 +121,10 @@ async function answer(question: string, material: string, prefix: string) {
     for await (const part of response) {
       if (aborted) break;
       const text = part.choices?.[0]?.delta?.content ?? '';
-      if (text) { complete += text; ctx.postMessage({ type: 'token', text }); }
+      if (text) { onToken(); complete += text; ctx.postMessage({ type: 'token', text }); }
     }
+    if (aborted) return;
+    if (!complete.trim()) throw new Error('The offline model returned an empty answer.');
     ctx.postMessage({ type: 'done', text: complete });
     return;
   }
@@ -98,13 +140,16 @@ async function answer(question: string, material: string, prefix: string) {
   for await (const part of stream) {
     if (aborted) break;
     const text = typeof part === 'string' ? part : part.choices?.[0]?.delta?.content ?? part.content ?? '';
-    if (text) { complete += text; ctx.postMessage({ type: 'token', text }); }
+    if (text) { onToken(); complete += text; ctx.postMessage({ type: 'token', text }); }
   }
+  if (aborted) return;
+  if (!complete.trim()) throw new Error('The offline model returned an empty answer.');
   ctx.postMessage({ type: 'done', text: complete });
 }
 
 ctx.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
+  if (message.type === 'stop') { aborted = true; try { engine?.interruptGenerate?.(); } catch { /* ignore */ } return; }
   if (message.type === 'unload') { aborted = true; engine = undefined; backendInUse = ''; ctx.postMessage({ type: 'unloaded' }); return; }
   try {
     if (message.type === 'load') await loadModel(message);
@@ -114,4 +159,11 @@ ctx.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   }
 };
 
+// Surface anything unexpected (GPU device lost, out of memory...) instead of failing silently.
+ctx.addEventListener('unhandledrejection', (event) => {
+  const reason = (event as PromiseRejectionEvent).reason;
+  ctx.postMessage({ type: 'error', scope: 'chat', text: reason instanceof Error ? reason.message : 'The offline model stopped unexpectedly.' });
+});
+
 export {};
+  
