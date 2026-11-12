@@ -30,6 +30,42 @@ const cpuModels = {
   standard: { repo: 'bartowski/Qwen2.5-1.5B-Instruct-GGUF', file: 'Qwen2.5-1.5B-Instruct-Q4_K_M.gguf' },
 };
 
+// Keep a reference so the browser cannot garbage-collect the WebGPU adapter while the model is running.
+let gpuAdapterRef: unknown;
+
+const friendlyGpuError = (error: unknown): string => {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Instance reference|mapAsync|device.*lost|DeviceLost|out of memory/i.test(message)) return 'the phone graphics chip stopped responding';
+  return message.slice(0, 120);
+};
+
+async function loadWebGpu(model: 'lite' | 'standard') {
+  const webllm = await import('@mlc-ai/web-llm');
+  const list = (webllm.prebuiltAppConfig as any)?.model_list as Array<{ model_id: string }> | undefined;
+  const adapter = await (navigator as any).gpu.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU graphics adapter was found on this device.');
+  gpuAdapterRef = adapter;
+  const hasF16 = adapter.features?.has?.('shader-f16') ?? false;
+  let modelId = hasF16 ? webGpuModels[model] : webGpuModelsF32[model];
+  if (list && !list.some((item) => item.model_id === modelId)) {
+    const alternative = hasF16 ? webGpuModelsF32[model] : webGpuModels[model];
+    if (list.some((item) => item.model_id === alternative)) modelId = alternative;
+    else throw new Error(`The installed WebLLM registry does not include ${modelId}.`);
+  }
+  engine = await webllm.CreateMLCEngine(modelId, {
+    initProgressCallback: (progress: { progress?: number; text?: string }) => ctx.postMessage({ type: 'progress', progress: Math.round((progress.progress ?? 0) * 100), text: progress.text ?? 'Preparing WebGPU model…' }),
+  });
+  // Prove the model can really generate before telling the student it is ready.
+  ctx.postMessage({ type: 'progress', progress: 100, text: 'Testing the model…' });
+  await withTimeout(
+    engine.chat.completions.create({ messages: [{ role: 'user', content: 'Say hi.' }], max_tokens: 4, temperature: 0 }),
+    FIRST_TOKEN_TIMEOUT_MS,
+    'The model downloaded but could not generate text on this device.',
+  );
+  backendInUse = 'WebGPU';
+  ctx.postMessage({ type: 'ready', backend: backendInUse, model: modelId });
+}
+
 async function loadModel(request: Extract<WorkerRequest, { type: 'load' }>) {
   engine = undefined;
   backendInUse = '';
@@ -40,33 +76,16 @@ async function loadModel(request: Extract<WorkerRequest, { type: 'load' }>) {
   }
   if (selectedBackend === 'webgpu') {
     try {
-      const webllm = await import('@mlc-ai/web-llm');
-      const list = (webllm.prebuiltAppConfig as any)?.model_list as Array<{ model_id: string }> | undefined;
-      const adapter = await (navigator as any).gpu.requestAdapter();
-      if (!adapter) throw new Error('No WebGPU graphics adapter was found on this device. Choose the CPU option instead.');
-      const hasF16 = adapter.features?.has?.('shader-f16') ?? false;
-      let modelId = hasF16 ? webGpuModels[request.model] : webGpuModelsF32[request.model];
-      if (list && !list.some((item) => item.model_id === modelId)) {
-        const alternative = hasF16 ? webGpuModelsF32[request.model] : webGpuModels[request.model];
-        if (list.some((item) => item.model_id === alternative)) modelId = alternative;
-        else throw new Error(`The installed WebLLM registry does not include ${modelId}. Update the app to use a supported model.`);
-      }
-      engine = await webllm.CreateMLCEngine(modelId, {
-        initProgressCallback: (progress: { progress?: number; text?: string }) => ctx.postMessage({ type: 'progress', progress: Math.round((progress.progress ?? 0) * 100), text: progress.text ?? 'Preparing WebGPU model…' }),
-      });
-      // Prove the model can really generate before telling the student it is ready.
-      ctx.postMessage({ type: 'progress', progress: 100, text: 'Testing the model…' });
-      await withTimeout(
-        engine.chat.completions.create({ messages: [{ role: 'user', content: 'Say hi.' }], max_tokens: 4, temperature: 0 }),
-        FIRST_TOKEN_TIMEOUT_MS,
-        'The model downloaded but could not generate text on this device. Try the CPU option, or the Lite model.',
-      );
-      backendInUse = 'WebGPU';
-      ctx.postMessage({ type: 'ready', backend: backendInUse, model: modelId });
+      await loadWebGpu(request.model);
+      return;
     } catch (error) {
-      throw new Error(error instanceof Error ? error.message : 'WebLLM model could not be loaded. Check WebGPU compatibility and available storage.');
+      // Phone GPUs often fail here (device lost, out of memory...). Fall back to the CPU model instead of giving up.
+      try { await engine?.unload?.(); } catch { /* ignore */ }
+      engine = undefined;
+      backendInUse = '';
+      console.error('WebGPU model failed, falling back to CPU', error);
+      ctx.postMessage({ type: 'progress', progress: 0, text: `WebGPU did not work on this device (${friendlyGpuError(error)}). Switching to the CPU model…` });
     }
-    return;
   }
   try {
     const wllama = await import('@wllama/wllama');
@@ -155,15 +174,17 @@ ctx.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     if (message.type === 'load') await loadModel(message);
     if (message.type === 'answer') await answer(message.question, message.material, message.prompt);
   } catch (error) {
-    ctx.postMessage({ type: 'error', scope: message.type === 'answer' ? 'chat' : 'load', text: error instanceof Error ? error.message : 'Local model encountered an unexpected error.' });
+    const gpuLost = backendInUse === 'WebGPU' && /Instance reference|mapAsync|device.*lost|DeviceLost/i.test(error instanceof Error ? error.message : String(error));
+    if (gpuLost) { engine = undefined; backendInUse = ''; }
+    ctx.postMessage({ type: 'error', scope: message.type === 'answer' ? 'chat' : 'load', text: gpuLost ? 'The phone graphics chip stopped during the answer. Choose a CPU option in the model list, then tap Download / Prepare.' : error instanceof Error ? error.message : 'Local model encountered an unexpected error.' });
   }
 };
 
 // Surface anything unexpected (GPU device lost, out of memory...) instead of failing silently.
 ctx.addEventListener('unhandledrejection', (event) => {
+  if (!backendInUse) return; // while loading, failures are handled (and fall back to CPU) in loadModel
   const reason = (event as PromiseRejectionEvent).reason;
   ctx.postMessage({ type: 'error', scope: 'chat', text: reason instanceof Error ? reason.message : 'The offline model stopped unexpectedly.' });
 });
 
 export {};
-  
